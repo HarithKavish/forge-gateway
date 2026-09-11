@@ -1,0 +1,15 @@
+name = "forge-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-09-11"
+
+[[durable_objects.bindings]]
+name = "PRESENCE"
+class_name = "PresenceRegistry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PresenceRegistry"]
+
+# GATEWAY_SHARED_SECRET is a secret, not a var -- set it with:
+#   wrangler secret put GATEWAY_SHARED_SECRET
+# Never committed here. See README.md for what it's standing in for.
