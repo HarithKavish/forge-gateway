@@ -1,4 +1,4 @@
-import type { Env, IngestEvent, PresenceEntry } from "./types";
+import type { Env, NormalizedEvent, PresenceEntry } from "./types";
 
 /**
  * One PresenceRegistry per workspace (see index.ts -- keyed by idFromName).
@@ -66,23 +66,29 @@ export class PresenceRegistry {
     const url = new URL(request.url);
 
     if (request.method === "POST" && url.pathname === "/events") {
-      let event: IngestEvent;
+      let body: NormalizedEvent & { sessionRef?: string };
       try {
-        event = await request.json();
+        body = await request.json();
       } catch {
         return new Response("Invalid JSON", { status: 400 });
       }
-      if (!event.sessionRef) return new Response("sessionRef required", { status: 400 });
+      if (!body.sessionRef) return new Response("sessionRef required", { status: 400 });
 
-      this.sessions.set(event.sessionRef, {
-        sessionRef: event.sessionRef,
-        state: event.state === "stopped" ? "offline" : "online",
-        activity: event.activity,
-        lastEventAt: event.timestamp ?? Date.now(),
+      // Whether this DO has ever seen this sessionRef before -- the signal
+      // index.ts uses to decide whether it still needs to confirm the
+      // registration with Forge. True on first event, and again after a
+      // full DO eviction + storage reload with a genuinely new session.
+      const isNew = !this.sessions.has(body.sessionRef);
+
+      this.sessions.set(body.sessionRef, {
+        sessionRef: body.sessionRef,
+        state: body.state === "stopped" ? "offline" : "online",
+        activity: body.activity,
+        lastEventAt: body.timestamp ?? Date.now(),
       });
       await this.persist();
       await this.scheduleSweep();
-      return new Response(null, { status: 204 });
+      return Response.json({ isNew });
     }
 
     if (request.method === "GET" && url.pathname === "/presence") {

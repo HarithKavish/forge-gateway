@@ -1,14 +1,28 @@
 export interface Env {
   PRESENCE: DurableObjectNamespace;
   GATEWAY_SHARED_SECRET: string;
+  FORGE_CALLBACK_URL: string;
 }
 
-/** What a hook/source adapter posts to /events. Content-free by design. */
-export interface IngestEvent {
-  sessionRef: string;
+/** Claims embedded in a Forge-minted pairing token. See src/pairing.ts. */
+export interface PairingClaims {
+  workspaceId: string;
+  ownerId: string;
+  provider: "claude" | "codex" | "gemini" | "other";
+  projectId: string | null;
+  label: string | null;
+  exp: number;
+}
+
+/**
+ * What a source adapter (src/adapters/*) normalizes a provider's native hook
+ * payload down to, and what actually reaches the PresenceRegistry Durable
+ * Object. Content-free by construction: state and a short activity label,
+ * never a prompt, a diff, tool input, or tool output.
+ */
+export interface NormalizedEvent {
   /** "stopped" is the only state that forces offline; anything else is online. */
   state: "working" | "idle" | "stopped";
-  /** A short label, e.g. "running tests". Never provider content. */
   activity?: string;
   timestamp?: number;
 }
