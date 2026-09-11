@@ -47,8 +47,12 @@ function fromBase64Url(value: string): string {
   return atob(padded);
 }
 
-/** Equal-length comparison that doesn't short-circuit on the first mismatch. */
-function safeEqual(a: string, b: string): boolean {
+/**
+ * Equal-length comparison that doesn't short-circuit on the first mismatch.
+ * Exported for index.ts's shared-secret check too -- same reasoning applies
+ * to any bearer-secret comparison, not just the pairing-token signature.
+ */
+export function safeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);

@@ -1,5 +1,5 @@
 import { normalizeClaudeEvent } from "./adapters/claude";
-import { deriveSessionRef, verifyPairingToken } from "./pairing";
+import { deriveSessionRef, safeEqual, verifyPairingToken } from "./pairing";
 import type { Env, NormalizedEvent } from "./types";
 
 export { PresenceRegistry } from "./presence";
@@ -74,8 +74,8 @@ async function handleClaudeEvent(request: Request, env: Env): Promise<Response> 
 }
 
 async function handlePresence(request: Request, env: Env): Promise<Response> {
-  const auth = request.headers.get("Authorization");
-  if (auth !== `Bearer ${env.GATEWAY_SHARED_SECRET}`) {
+  const auth = request.headers.get("Authorization") ?? "";
+  if (!safeEqual(auth, `Bearer ${env.GATEWAY_SHARED_SECRET}`)) {
     return new Response("Unauthorized", { status: 401 });
   }
 
