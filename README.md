@@ -8,9 +8,9 @@ with that presence. It never stores what an agent said or did — see
 [Data model](#data-model) below.
 
 Design source of truth: `docs/WORLDVIEW.md` in the Forge repo. This repo
-implements build-order steps 2 and 3 from that document — the gateway
-skeleton (presence, snapshot REST) plus a real Claude Code source adapter.
-WebSocket fan-out (step 4) isn't built yet; Worldview polls the snapshot.
+implements build-order steps 2 through 4 from that document — the presence
+registry, a real Claude Code source adapter, and live WebSocket fan-out to
+the browser.
 
 ## Where it lives
 
@@ -91,9 +91,23 @@ considers the session new again (e.g. after a Durable Object eviction).
   response for permission decisions on some events, and an empty object
   means no opinion, never a block.
 - `GET /presence?workspaceId=<id>` — returns `{ sessions: PresenceEntry[] }`
-  for the workspace. This is Forge's own server rendering Worldview, not an
-  agent, so it stays on the plain `Authorization: Bearer
-  <GATEWAY_SHARED_SECRET>`.
+  for the workspace. This is Forge's own server rendering Worldview on first
+  load, not an agent or a browser, so it stays on the plain `Authorization:
+  Bearer <GATEWAY_SHARED_SECRET>`.
+- `GET /ws?token=<viewer token>` — WebSocket upgrade. The browser connects
+  here directly (not through Forge's server), carrying a short-lived viewer
+  token Forge mints from the visitor's own session
+  (`lib/gateway/viewer.ts` in Forge, `src/viewer.ts` here — 10-minute TTL,
+  reissued on every reconnect). The token's `workspaceId` claim is the only
+  thing that decides which workspace's `PresenceRegistry` the socket
+  attaches to; there's no separate parameter a caller could mismatch it
+  with. On connect, the server sends one `{"type":"snapshot","sessions":
+  [...]}"` message with everything currently known, then a
+  `{"type":"update","session":{...}}` message every time any session's
+  presence changes. Read-only: nothing sent from the browser does anything,
+  other than a literal `"ping"` answered with `"pong"` as a liveness check.
+  Built on Durable Objects' Hibernation API, so a socket sitting idle
+  between events doesn't keep its `PresenceRegistry` billed as active.
 
 A future provider (Codex, Gemini, …) gets its own `/events/<provider>` route
 and its own file under `src/adapters/`, each reading whatever that
@@ -116,6 +130,20 @@ reads exactly two fields off Claude Code's native payload
 running the adapter against real payloads, including one carrying a
 deliberately sensitive `tool_input.command` and `last_assistant_message`,
 and confirming neither ever reaches `/presence`.
+
+## Verified locally
+
+Both the Claude Code adapter and the WebSocket fan-out were exercised
+against a real local `wrangler dev`, not just read for correctness:
+auth rejection (missing/garbage/expired pairing and viewer tokens),
+the full `SessionStart` → `PreToolUse` → `PostToolUse` → `Stop` →
+`SessionEnd` state progression reflected correctly in `/presence`, a
+deliberately sensitive `tool_input.command` and `last_assistant_message`
+confirmed to never surface anywhere, Forge's Node.js `deriveSessionRef`
+and this repo's WebCrypto implementation confirmed to produce
+byte-identical output for the same token, and a live WebSocket client
+confirmed to receive the initial snapshot and then a real-time `update`
+message the instant a triggered event landed.
 
 ## Ecosystem membership
 

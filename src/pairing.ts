@@ -1,3 +1,4 @@
+import { fromBase64Url, hmac, safeEqual } from "./hmac";
 import type { Env, PairingClaims } from "./types";
 
 /**
@@ -20,44 +21,6 @@ import type { Env, PairingClaims } from "./types";
  * which invalidates every token everywhere. Forge's own session cookies
  * already accept the identical tradeoff (docs/AUTH.md "Sessions").
  */
-
-async function hmac(secret: string, payload: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payload));
-  return toBase64Url(new Uint8Array(signature));
-}
-
-function toBase64Url(bytes: Uint8Array): string {
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function fromBase64Url(value: string): string {
-  const padded = value
-    .replace(/-/g, "+")
-    .replace(/_/g, "/")
-    .padEnd(value.length + ((4 - (value.length % 4)) % 4), "=");
-  return atob(padded);
-}
-
-/**
- * Equal-length comparison that doesn't short-circuit on the first mismatch.
- * Exported for index.ts's shared-secret check too -- same reasoning applies
- * to any bearer-secret comparison, not just the pairing-token signature.
- */
-export function safeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
 
 export async function verifyPairingToken(env: Env, token: string): Promise<PairingClaims> {
   const [body, signature] = token.split(".");

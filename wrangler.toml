@@ -20,5 +20,6 @@ FORGE_CALLBACK_URL = "http://localhost:3000"
 #   wrangler secret put GATEWAY_SHARED_SECRET
 # Never committed here. Must match Forge's own GATEWAY_SHARED_SECRET exactly
 # -- it signs/verifies pairing tokens on Forge's side, authenticates this
-# Worker's callback to Forge, and (indirectly, as the ingest-token signing
-# key) proves an event actually came from this gateway. See README.md.
+# Worker's callback to Forge, and (as the verification key here) is what lets
+# this Worker check a pairing or viewer token's signature without a round
+# trip to Forge. See README.md.

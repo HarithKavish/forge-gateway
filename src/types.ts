@@ -15,6 +15,18 @@ export interface PairingClaims {
 }
 
 /**
+ * Claims embedded in a Forge-minted viewer token. See src/viewer.ts. Unlike
+ * a pairing token, this gateway only ever verifies one -- Forge is the only
+ * party that mints them, since a viewer token is issued from a Forge
+ * session, and this gateway has no notion of a Forge session of its own.
+ */
+export interface ViewerClaims {
+  workspaceId: string;
+  userId: string;
+  exp: number;
+}
+
+/**
  * What a source adapter (src/adapters/*) normalizes a provider's native hook
  * payload down to, and what actually reaches the PresenceRegistry Durable
  * Object. Content-free by construction: state and a short activity label,

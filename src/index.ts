@@ -1,6 +1,8 @@
 import { normalizeClaudeEvent } from "./adapters/claude";
-import { deriveSessionRef, safeEqual, verifyPairingToken } from "./pairing";
+import { safeEqual } from "./hmac";
+import { deriveSessionRef, verifyPairingToken } from "./pairing";
 import type { Env, NormalizedEvent } from "./types";
+import { verifyViewerToken } from "./viewer";
 
 export { PresenceRegistry } from "./presence";
 
@@ -14,8 +16,15 @@ export { PresenceRegistry } from "./presence";
  * one-shot exchange, and src/adapters/claude.ts for what actually gets read
  * out of Claude Code's payload.
  *
- * `GET /presence` is different: it's Forge's own server rendering Worldview,
- * not an agent, so it stays on the plain shared-secret bearer.
+ * `GET /ws` is the WebSocket fan-out (build order step 4): the browser
+ * connects directly to this Worker, not through Forge's server, carrying a
+ * short-lived viewer token Forge minted from the visitor's own session
+ * (lib/gateway/viewer.ts there, src/viewer.ts here). Verified here, at the
+ * edge, before the upgrade is ever forwarded to a Durable Object.
+ *
+ * `GET /presence` is different: it's Forge's own server rendering Worldview
+ * on first load, not an agent or a browser, so it stays on the plain
+ * shared-secret bearer.
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -23,6 +32,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/events/claude") {
       return handleClaudeEvent(request, env);
+    }
+
+    if (url.pathname === "/ws") {
+      return handleWebSocket(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/presence") {
@@ -71,6 +84,28 @@ async function handleClaudeEvent(request: Request, env: Env): Promise<Response> 
   // Hooks read the response body for permission decisions on some events.
   // An empty object means no opinion -- never block a tool call from here.
   return Response.json({});
+}
+
+async function handleWebSocket(request: Request, env: Env): Promise<Response> {
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("Expected a WebSocket upgrade", { status: 426 });
+  }
+
+  const token = new URL(request.url).searchParams.get("token");
+  if (!token) return new Response("token is required", { status: 401 });
+
+  let claims;
+  try {
+    claims = await verifyViewerToken(env, token);
+  } catch {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  // The workspace to connect to comes only from the verified token, never a
+  // separately-supplied query param -- there is nothing a caller could pass
+  // to see a workspace they weren't issued a token for.
+  const stub = registryFor(env, claims.workspaceId);
+  return stub.fetch(new Request("https://presence/ws", request));
 }
 
 async function handlePresence(request: Request, env: Env): Promise<Response> {

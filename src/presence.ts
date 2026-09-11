@@ -9,8 +9,13 @@ import type { Env, NormalizedEvent, PresenceEntry } from "./types";
  * "stopped" event or when no event arrives within ONLINE_TIMEOUT_MS; the
  * alarm below is what notices the second case.
  *
- * WebSocket fan-out (build order step 4) attaches here later -- for now this
- * only answers ingest and snapshot requests, per step 2's scope.
+ * WebSocket fan-out (build order step 4): uses the Hibernation API
+ * (`ctx.acceptWebSocket`), not a plain accept loop, so a DO with viewers
+ * connected but no events flowing doesn't stay billed as active -- Cloudflare
+ * can evict it between messages and wake it back up on the next one. That's
+ * also why sockets are never tracked in an instance field: `ctx.getWebSockets()`
+ * is the source of truth, because hibernation can construct a fresh instance
+ * of this class to handle a wakeup.
  */
 
 const ONLINE_TIMEOUT_MS = 90_000;
@@ -43,6 +48,18 @@ export class PresenceRegistry {
     }
   }
 
+  private broadcast(entry: PresenceEntry): void {
+    const message = JSON.stringify({ type: "update", session: entry });
+    for (const ws of this.ctx.getWebSockets()) {
+      try {
+        ws.send(message);
+      } catch {
+        // A socket that can't accept a send is on its way out; webSocketClose
+        // (or the next hibernation wakeup) reconciles ctx.getWebSockets().
+      }
+    }
+  }
+
   /** Marks anything that's gone quiet for too long offline. */
   async alarm(): Promise<void> {
     await this.ensureLoaded();
@@ -53,6 +70,7 @@ export class PresenceRegistry {
       if (entry.state === "online" && entry.lastEventAt < cutoff) {
         entry.state = "offline";
         changed = true;
+        this.broadcast(entry);
       }
     }
     if (changed) await this.persist();
@@ -64,6 +82,10 @@ export class PresenceRegistry {
   async fetch(request: Request): Promise<Response> {
     await this.ensureLoaded();
     const url = new URL(request.url);
+
+    if (url.pathname === "/ws") {
+      return this.acceptViewer();
+    }
 
     if (request.method === "POST" && url.pathname === "/events") {
       let body: NormalizedEvent & { sessionRef?: string };
@@ -80,14 +102,16 @@ export class PresenceRegistry {
       // full DO eviction + storage reload with a genuinely new session.
       const isNew = !this.sessions.has(body.sessionRef);
 
-      this.sessions.set(body.sessionRef, {
+      const entry: PresenceEntry = {
         sessionRef: body.sessionRef,
         state: body.state === "stopped" ? "offline" : "online",
         activity: body.activity,
         lastEventAt: body.timestamp ?? Date.now(),
-      });
+      };
+      this.sessions.set(body.sessionRef, entry);
       await this.persist();
       await this.scheduleSweep();
+      this.broadcast(entry);
       return Response.json({ isNew });
     }
 
@@ -96,5 +120,34 @@ export class PresenceRegistry {
     }
 
     return new Response("Not found", { status: 404 });
+  }
+
+  /** index.ts has already verified the viewer token before forwarding here. */
+  private acceptViewer(): Response {
+    // A WebSocketPair always has exactly these two entries; the indexed
+    // access is only "possibly undefined" to noUncheckedIndexedAccess, not
+    // in practice.
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+
+    this.ctx.acceptWebSocket(server);
+    server.send(JSON.stringify({ type: "snapshot", sessions: [...this.sessions.values()] }));
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * Required by the Hibernation API even though viewers never send anything
+   * meaningful -- Worldview is read-only by design (docs/WORLDVIEW.md §1).
+   * Answers a bare "ping" so a client can confirm the socket is still live
+   * without that counting as a real message.
+   */
+  webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): void {
+    if (message === "ping") ws.send("pong");
+  }
+
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    ws.close(wasClean ? code : 1011, reason);
   }
 }
