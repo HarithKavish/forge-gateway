@@ -8,8 +8,9 @@ with that presence. It never stores what an agent said or did — see
 [Data model](#data-model) below.
 
 Design source of truth: `docs/WORLDVIEW.md` in the Forge repo. This repo
-implements build-order step 2 from that document — the gateway skeleton
-(ingest + in-memory presence + snapshot REST, no WebSocket yet).
+implements build-order steps 2 through 4 from that document — the presence
+registry, a real Claude Code source adapter, and live WebSocket fan-out to
+the browser.
 
 ## Where it lives
 
@@ -22,30 +23,96 @@ Requires Node 20+ and a Cloudflare account.
 
 ```bash
 npm install
-wrangler secret put GATEWAY_SHARED_SECRET   # any strong random value, for local dev too
+wrangler secret put GATEWAY_SHARED_SECRET   # any strong random value
 npm run dev
 ```
 
-`GATEWAY_SHARED_SECRET` gates every request for now — a placeholder for this
-skeleton step. The real model (per-registration pairing tokens, short-lived
-per-viewer tokens) lands with the registration flow and WebSocket fan-out;
-see `src/index.ts` for exactly where that's marked.
+`GATEWAY_SHARED_SECRET` must be **identical** to Forge's own
+`GATEWAY_SHARED_SECRET` — it signs and verifies pairing tokens on both sides,
+and authenticates this Worker's callback to Forge. `FORGE_CALLBACK_URL`
+(`wrangler.toml`, a plain var — defaults to `http://localhost:3000`) needs to
+point at wherever Forge actually runs.
 
 Deploy with `npm run deploy`. Typecheck with `npm run typecheck`.
 
-## API (current)
+## Connecting a real Claude Code session
 
-Both endpoints take `workspaceId` as a query parameter and require
-`Authorization: Bearer <GATEWAY_SHARED_SECRET>`.
+There is no wrapper script. Claude Code's native `type: "http"` hooks POST
+directly to this gateway; a pairing token from Forge's `/worldview` page
+("Connect a real agent") is the only credential needed.
 
-- `POST /events` — body `{ sessionRef, state, activity?, timestamp? }`.
-  `state` is `"working"`, `"idle"`, or `"stopped"`; anything but `"stopped"`
-  marks the session online. Returns `204`.
-- `GET /presence` — returns `{ sessions: PresenceEntry[] }` for the workspace.
+1. On Forge's `/worldview` page, mint a pairing token. Forge shows the exact
+   `export WORLDVIEW_PAIRING_TOKEN=...` line and `.claude/settings.json`
+   block to paste — copy both.
+2. Set the env var wherever `claude` runs, and add the hook config. It wires
+   `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`, and `SessionEnd` to
+   `POST {gatewayUrl}/events/claude`, with
+   `Authorization: Bearer $WORLDVIEW_PAIRING_TOKEN` via `allowedEnvVars`.
+3. Start a Claude Code session. The first event registers the session in
+   Forge (one callback, not one per tool call — see [How registration
+   works](#how-registration-works)); every session shows as `Registered` on
+   `/worldview` from then on.
 
-There is no registration endpoint yet — `sessionRef` values are expected to
-already exist as `agent_sessions` rows in Forge (registered manually today,
-via `/worldview`).
+The pairing token is used directly, and repeatedly, as the bearer credential
+for the whole life of that hook config — there's no separate short-lived
+token exchanged after the first use, because a native `http` hook has
+nowhere to cache one between invocations (each firing is a fresh, stateless
+request). It's valid for 90 days. **There is no way to revoke a single
+leaked token early** short of rotating `GATEWAY_SHARED_SECRET`, which
+invalidates every token everywhere — the same tradeoff Forge's own session
+cookies already accept (`docs/AUTH.md` "Sessions" in the Forge repo).
+
+## How registration works
+
+`sessionRef` is derived deterministically from the pairing token itself —
+`sr_` + the first 32 hex characters of `SHA-256(token)` — computed
+independently by Forge and by this gateway from the identical raw token
+string (`src/pairing.ts` here, `lib/gateway/pairing.ts` in Forge). Neither
+side has to tell the other what it is.
+
+That means presence recording never waits on Forge: every event verifies the
+token locally (this gateway holds the same signing secret) and writes to the
+workspace's `PresenceRegistry` immediately. Only the *first* event for a
+given `sessionRef` also triggers a callback to
+`POST {FORGE_CALLBACK_URL}/api/gateway/sessions`, which is what actually
+creates the `agent_sessions` row — everything after that is presence-only,
+so a session mid-conversation isn't hitting Forge's Postgres on every tool
+call. If that first callback fails (Forge unreachable, say), presence still
+gets recorded; the callback is simply retried the next time this gateway
+considers the session new again (e.g. after a Durable Object eviction).
+
+## API
+
+- `POST /events/claude` — Claude Code's source adapter (`src/adapters/claude.ts`).
+  Body is Claude Code's own native hook payload, sent as-is by a `type:
+  "http"` hook — this endpoint reads only `hook_event_name` and `tool_name`
+  out of it, nothing else (see [Data model](#data-model)).
+  `Authorization: Bearer <pairing token>`. Returns `{}` — hooks read the
+  response for permission decisions on some events, and an empty object
+  means no opinion, never a block.
+- `GET /presence?workspaceId=<id>` — returns `{ sessions: PresenceEntry[] }`
+  for the workspace. This is Forge's own server rendering Worldview on first
+  load, not an agent or a browser, so it stays on the plain `Authorization:
+  Bearer <GATEWAY_SHARED_SECRET>`.
+- `GET /ws?token=<viewer token>` — WebSocket upgrade. The browser connects
+  here directly (not through Forge's server), carrying a short-lived viewer
+  token Forge mints from the visitor's own session
+  (`lib/gateway/viewer.ts` in Forge, `src/viewer.ts` here — 10-minute TTL,
+  reissued on every reconnect). The token's `workspaceId` claim is the only
+  thing that decides which workspace's `PresenceRegistry` the socket
+  attaches to; there's no separate parameter a caller could mismatch it
+  with. On connect, the server sends one `{"type":"snapshot","sessions":
+  [...]}"` message with everything currently known, then a
+  `{"type":"update","session":{...}}` message every time any session's
+  presence changes. Read-only: nothing sent from the browser does anything,
+  other than a literal `"ping"` answered with `"pong"` as a liveness check.
+  Built on Durable Objects' Hibernation API, so a socket sitting idle
+  between events doesn't keep its `PresenceRegistry` billed as active.
+
+A future provider (Codex, Gemini, …) gets its own `/events/<provider>` route
+and its own file under `src/adapters/`, each reading whatever that
+provider's native hook/callback shape actually is — this Worker and the
+`PresenceRegistry` Durable Object don't change.
 
 ## Data model
 
@@ -55,6 +122,28 @@ workspace. It is never written to Forge's Postgres, and a session that's
 gone offline for good has no history to look back at. That split is
 deliberate and load-bearing, not a v1 shortcut — see `docs/WORLDVIEW.md` §4
 in the Forge repo for why.
+
+The activity label is deliberately thin: a tool's *name* ("Bash", "Edit"),
+never its arguments, output, or anything Claude said. `src/adapters/claude.ts`
+reads exactly two fields off Claude Code's native payload
+(`hook_event_name`, `tool_name`) and nothing else — verified locally by
+running the adapter against real payloads, including one carrying a
+deliberately sensitive `tool_input.command` and `last_assistant_message`,
+and confirming neither ever reaches `/presence`.
+
+## Verified locally
+
+Both the Claude Code adapter and the WebSocket fan-out were exercised
+against a real local `wrangler dev`, not just read for correctness:
+auth rejection (missing/garbage/expired pairing and viewer tokens),
+the full `SessionStart` → `PreToolUse` → `PostToolUse` → `Stop` →
+`SessionEnd` state progression reflected correctly in `/presence`, a
+deliberately sensitive `tool_input.command` and `last_assistant_message`
+confirmed to never surface anywhere, Forge's Node.js `deriveSessionRef`
+and this repo's WebCrypto implementation confirmed to produce
+byte-identical output for the same token, and a live WebSocket client
+confirmed to receive the initial snapshot and then a real-time `update`
+message the instant a triggered event landed.
 
 ## Ecosystem membership
 
