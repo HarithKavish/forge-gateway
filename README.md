@@ -57,10 +57,16 @@ The pairing token is used directly, and repeatedly, as the bearer credential
 for the whole life of that hook config — there's no separate short-lived
 token exchanged after the first use, because a native `http` hook has
 nowhere to cache one between invocations (each firing is a fresh, stateless
-request). It's valid for 90 days. **There is no way to revoke a single
-leaked token early** short of rotating `GATEWAY_SHARED_SECRET`, which
-invalidates every token everywhere — the same tradeoff Forge's own session
-cookies already accept (`docs/AUTH.md` "Sessions" in the Forge repo).
+request). It's valid for 90 days.
+
+Revoking a session in Forge (`/worldview` → Revoke) does take effect here,
+but not instantly: this gateway verifies a pairing token's signature
+locally and never re-checks Forge on every event, so it re-checks
+periodically instead (`POST /api/gateway/sessions/status`, every 5 minutes
+— see `src/presence.ts`). A revoked token is rejected within one interval
+of being revoked, not immediately. Rotating `GATEWAY_SHARED_SECRET` remains
+the only way to invalidate a token instantly, at the cost of invalidating
+every pairing *and* viewer token everywhere at once.
 
 ## How registration works
 
@@ -144,6 +150,16 @@ and this repo's WebCrypto implementation confirmed to produce
 byte-identical output for the same token, and a live WebSocket client
 confirmed to receive the initial snapshot and then a real-time `update`
 message the instant a triggered event landed.
+
+The periodic revocation check was exercised the same way, against a mock
+Forge server: a session confirmed online, then flipped to `revoked` by the
+mock, correctly went `offline` on the next check cycle (well before its
+online-timeout would have expired it anyway, to rule out a false pass), and
+a further event with that same token came back a clean `200 {}` rather than
+resurrecting its presence. That run also caught a real bug -- the Worker
+was unconditionally parsing the Durable Object's response as JSON, which
+crashed with a 500 the first time that response was a plain-text 403
+instead -- fixed before this was committed, not after.
 
 ## Ecosystem membership
 

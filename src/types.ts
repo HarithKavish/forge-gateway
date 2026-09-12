@@ -39,6 +39,11 @@ export interface NormalizedEvent {
   timestamp?: number;
 }
 
+/** Response shape from POST /api/gateway/sessions/status (Forge repo). */
+export interface ForgeStatusResponse {
+  statuses: Record<string, "active" | "revoked">;
+}
+
 export type PresenceState = "online" | "offline";
 
 /** What lives in a workspace's PresenceRegistry. Never written to Forge's Postgres. */

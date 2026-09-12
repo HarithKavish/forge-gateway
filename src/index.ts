@@ -67,11 +67,12 @@ async function handleClaudeEvent(request: Request, env: Env): Promise<Response> 
 
   const event = normalizeClaudeEvent(payload);
   const sessionRef = await deriveSessionRef(token);
-  const isNew = await recordPresence(env, claims.workspaceId, sessionRef, event);
+  const result = await recordPresence(env, claims.workspaceId, sessionRef, event);
 
   // Confirm with Forge once per session, not once per tool call -- everyone
-  // after the first event on a given sessionRef skips this entirely.
-  if (isNew) {
+  // after the first event on a given sessionRef skips this entirely. Never
+  // for a revoked session -- there's nothing to confirm.
+  if (result.isNew && !result.revoked) {
     await confirmWithForge(env, token).catch(() => {
       // Presence still recorded either way. A failed confirm here just
       // means Worldview's registered-sessions list won't show this one
@@ -81,8 +82,12 @@ async function handleClaudeEvent(request: Request, env: Env): Promise<Response> 
     });
   }
 
-  // Hooks read the response body for permission decisions on some events.
-  // An empty object means no opinion -- never block a tool call from here.
+  // Always 200 with an empty object, revoked or not. Hooks read the response
+  // body for permission decisions on some events -- Worldview must never be
+  // the thing that blocks a tool call (docs/WORLDVIEW.md §1), so a revoked
+  // session is handled by quietly no-op'ing the presence/confirm side of
+  // this request, never by returning something that could be misread as a
+  // block decision.
   return Response.json({});
 }
 
@@ -121,21 +126,26 @@ async function handlePresence(request: Request, env: Env): Promise<Response> {
   return stub.fetch("https://presence/presence");
 }
 
-/** Returns whether this was the first event this gateway has seen for the session. */
 async function recordPresence(
   env: Env,
   workspaceId: string,
   sessionRef: string,
   event: NormalizedEvent,
-): Promise<boolean> {
+): Promise<{ isNew: boolean; revoked: boolean }> {
   const stub = registryFor(env, workspaceId);
   const response = await stub.fetch("https://presence/events", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionRef, ...event }),
+    body: JSON.stringify({ sessionRef, workspaceId, ...event }),
   });
+
+  // A revoked session gets a 403 with a JSON body from the DO (src/
+  // presence.ts) -- distinguishable from isNew, never left to a bare-text
+  // response a caller might try to JSON-parse and crash on.
+  if (response.status === 403) return { isNew: false, revoked: true };
+
   const { isNew } = (await response.json()) as { isNew: boolean };
-  return isNew;
+  return { isNew, revoked: false };
 }
 
 async function confirmWithForge(env: Env, pairingToken: string): Promise<void> {

@@ -1,4 +1,4 @@
-import type { Env, NormalizedEvent, PresenceEntry } from "./types";
+import type { Env, ForgeStatusResponse, NormalizedEvent, PresenceEntry } from "./types";
 
 /**
  * One PresenceRegistry per workspace (see index.ts -- keyed by idFromName).
@@ -8,6 +8,15 @@ import type { Env, NormalizedEvent, PresenceEntry } from "./types";
  * docs/WORLDVIEW.md §4). A session goes offline either on an explicit
  * "stopped" event or when no event arrives within ONLINE_TIMEOUT_MS; the
  * alarm below is what notices the second case.
+ *
+ * The same alarm also closes the revocation gap noted in docs/WORLDVIEW.md
+ * §8: this object verifies a pairing token's signature locally and never
+ * asks Forge about it again per event, which means "Revoke" alone doesn't
+ * stop an agent. Every REVOCATION_CHECK_INTERVAL_MS, it asks Forge whether
+ * everything it's currently tracking is still `active`, and rejects further
+ * events for anything that comes back `revoked` (or missing entirely). That
+ * trades instant revocation for not hitting Postgres on every tool call --
+ * the gap narrows to at most one interval, it doesn't close to zero.
  *
  * WebSocket fan-out (build order step 4): uses the Hibernation API
  * (`ctx.acceptWebSocket`), not a plain accept loop, so a DO with viewers
@@ -19,32 +28,51 @@ import type { Env, NormalizedEvent, PresenceEntry } from "./types";
  */
 
 const ONLINE_TIMEOUT_MS = 90_000;
+const REVOCATION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const ALARM_INTERVAL_MS = ONLINE_TIMEOUT_MS;
 
 export class PresenceRegistry {
   private readonly ctx: DurableObjectState;
+  private readonly env: Env;
   private sessions = new Map<string, PresenceEntry>();
+  private revoked = new Set<string>();
+  private workspaceId: string | undefined;
+  private lastRevocationCheckAt = 0;
   private loaded = false;
 
-  constructor(ctx: DurableObjectState, _env: Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
+    this.env = env;
   }
 
   private async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
-    const stored = await this.ctx.storage.get<Record<string, PresenceEntry>>("sessions");
-    if (stored) this.sessions = new Map(Object.entries(stored));
+    const [sessions, revoked, workspaceId, lastCheck] = await Promise.all([
+      this.ctx.storage.get<Record<string, PresenceEntry>>("sessions"),
+      this.ctx.storage.get<string[]>("revoked"),
+      this.ctx.storage.get<string>("workspaceId"),
+      this.ctx.storage.get<number>("lastRevocationCheckAt"),
+    ]);
+    if (sessions) this.sessions = new Map(Object.entries(sessions));
+    if (revoked) this.revoked = new Set(revoked);
+    if (workspaceId) this.workspaceId = workspaceId;
+    if (lastCheck) this.lastRevocationCheckAt = lastCheck;
     this.loaded = true;
   }
 
-  private async persist(): Promise<void> {
+  private async persistSessions(): Promise<void> {
     await this.ctx.storage.put("sessions", Object.fromEntries(this.sessions));
   }
 
-  /** Makes sure a sweep is scheduled whenever at least one session is online. */
+  private async persistRevoked(): Promise<void> {
+    await this.ctx.storage.put("revoked", [...this.revoked]);
+  }
+
+  /** Makes sure the sweep/revocation alarm is scheduled whenever any session is tracked. */
   private async scheduleSweep(): Promise<void> {
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null) {
-      await this.ctx.storage.setAlarm(Date.now() + ONLINE_TIMEOUT_MS);
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
     }
   }
 
@@ -60,7 +88,7 @@ export class PresenceRegistry {
     }
   }
 
-  /** Marks anything that's gone quiet for too long offline. */
+  /** Marks anything that's gone quiet for too long offline, and re-checks revocation. */
   async alarm(): Promise<void> {
     await this.ensureLoaded();
     const cutoff = Date.now() - ONLINE_TIMEOUT_MS;
@@ -73,10 +101,60 @@ export class PresenceRegistry {
         this.broadcast(entry);
       }
     }
-    if (changed) await this.persist();
+    if (changed) await this.persistSessions();
 
-    const stillOnline = [...this.sessions.values()].some((e) => e.state === "online");
-    if (stillOnline) await this.ctx.storage.setAlarm(Date.now() + ONLINE_TIMEOUT_MS);
+    if (Date.now() - this.lastRevocationCheckAt >= REVOCATION_CHECK_INTERVAL_MS) {
+      await this.checkRevocations();
+    }
+
+    if (this.sessions.size > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + ALARM_INTERVAL_MS);
+    }
+  }
+
+  /** Asks Forge which currently-tracked sessions are still active. */
+  private async checkRevocations(): Promise<void> {
+    this.lastRevocationCheckAt = Date.now();
+    await this.ctx.storage.put("lastRevocationCheckAt", this.lastRevocationCheckAt);
+
+    if (!this.workspaceId || this.sessions.size === 0) return;
+
+    let statuses: ForgeStatusResponse["statuses"];
+    try {
+      const response = await fetch(`${this.env.FORGE_CALLBACK_URL}/api/gateway/sessions/status`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.env.GATEWAY_SHARED_SECRET}`,
+        },
+        body: JSON.stringify({
+          workspaceId: this.workspaceId,
+          sessionRefs: [...this.sessions.keys()],
+        }),
+      });
+      if (!response.ok) return;
+      ({ statuses } = (await response.json()) as ForgeStatusResponse);
+    } catch {
+      // Forge unreachable this round -- try again at the next interval.
+      // Nothing already revoked is un-revoked by a failed check either.
+      return;
+    }
+
+    let revokedChanged = false;
+    for (const [sessionRef, status] of Object.entries(statuses)) {
+      if (status === "revoked" && !this.revoked.has(sessionRef)) {
+        this.revoked.add(sessionRef);
+        revokedChanged = true;
+        const entry = this.sessions.get(sessionRef);
+        if (entry && entry.state === "online") {
+          entry.state = "offline";
+          this.broadcast(entry);
+        }
+      }
+    }
+    if (revokedChanged) {
+      await Promise.all([this.persistRevoked(), this.persistSessions()]);
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -88,13 +166,22 @@ export class PresenceRegistry {
     }
 
     if (request.method === "POST" && url.pathname === "/events") {
-      let body: NormalizedEvent & { sessionRef?: string };
+      let body: NormalizedEvent & { sessionRef?: string; workspaceId?: string };
       try {
         body = await request.json();
       } catch {
         return new Response("Invalid JSON", { status: 400 });
       }
       if (!body.sessionRef) return new Response("sessionRef required", { status: 400 });
+
+      if (this.revoked.has(body.sessionRef)) {
+        return Response.json({ revoked: true }, { status: 403 });
+      }
+
+      if (body.workspaceId && !this.workspaceId) {
+        this.workspaceId = body.workspaceId;
+        await this.ctx.storage.put("workspaceId", body.workspaceId);
+      }
 
       // Whether this DO has ever seen this sessionRef before -- the signal
       // index.ts uses to decide whether it still needs to confirm the
@@ -109,7 +196,7 @@ export class PresenceRegistry {
         lastEventAt: body.timestamp ?? Date.now(),
       };
       this.sessions.set(body.sessionRef, entry);
-      await this.persist();
+      await this.persistSessions();
       await this.scheduleSweep();
       this.broadcast(entry);
       return Response.json({ isNew });
