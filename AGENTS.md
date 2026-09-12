@@ -39,6 +39,14 @@ actual logic.
   Forge's Postgres, and must never persist here longer than a session stays
   relevant. This is a hard constraint from `docs/WORLDVIEW.md` §4, not a
   style preference.
-- `GATEWAY_SHARED_SECRET` gates every request today as a placeholder — see
-  the comment in `src/index.ts` before changing the auth model, since a real
-  per-registration/per-viewer token scheme is planned to replace it.
+- Agents never see `GATEWAY_SHARED_SECRET`. A Claude Code hook holds a
+  pairing token instead (`src/pairing.ts`) — verified locally against the
+  same secret, but not the secret itself. Don't "simplify" auth by handing
+  the shared secret to a hook config; that's the credential-leak trap this
+  design specifically avoids.
+- Adding a new provider (Codex, Gemini, …) means a new `src/adapters/*.ts`
+  and a new `/events/<provider>` route in `src/index.ts` — not a change to
+  `PresenceRegistry` or the pairing/session model. See `src/adapters/claude.ts`
+  for the shape one takes, and read only whatever fields are actually a
+  category label (a tool name, an event name) — never a provider's raw
+  payload wholesale.

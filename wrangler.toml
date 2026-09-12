@@ -1,0 +1,25 @@
+name = "forge-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-09-11"
+
+[[durable_objects.bindings]]
+name = "PRESENCE"
+class_name = "PresenceRegistry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["PresenceRegistry"]
+
+[vars]
+# Where the pairing-token relay calls back to (POST /api/gateway/sessions).
+# Not secret -- override per environment, e.g. with `[env.production.vars]`
+# once there's a production Forge deploy to point at.
+FORGE_CALLBACK_URL = "http://localhost:3000"
+
+# GATEWAY_SHARED_SECRET is a secret, not a var -- set it with:
+#   wrangler secret put GATEWAY_SHARED_SECRET
+# Never committed here. Must match Forge's own GATEWAY_SHARED_SECRET exactly
+# -- it signs/verifies pairing tokens on Forge's side, authenticates this
+# Worker's callback to Forge, and (as the verification key here) is what lets
+# this Worker check a pairing or viewer token's signature without a round
+# trip to Forge. See README.md.
