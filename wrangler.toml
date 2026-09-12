@@ -12,9 +12,10 @@ new_sqlite_classes = ["PresenceRegistry"]
 
 [vars]
 # Where the pairing-token relay calls back to (POST /api/gateway/sessions).
-# Not secret -- override per environment, e.g. with `[env.production.vars]`
-# once there's a production Forge deploy to point at.
-FORGE_CALLBACK_URL = "http://localhost:3000"
+# Not secret. This is the deployed default (production Forge); local dev
+# overrides it via .dev.vars (gitignored, not committed) so `wrangler dev`
+# still points at localhost.
+FORGE_CALLBACK_URL = "https://forge.harithkavish.com"
 
 # GATEWAY_SHARED_SECRET is a secret, not a var -- set it with:
 #   wrangler secret put GATEWAY_SHARED_SECRET
