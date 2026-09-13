@@ -25,6 +25,17 @@ export { PresenceRegistry } from "./presence";
  * `GET /presence` is different: it's Forge's own server rendering Worldview
  * on first load, not an agent or a browser, so it stays on the plain
  * shared-secret bearer.
+ *
+ * `POST /events/bridge` is the Forge Local Bridge's endpoint (see the forge
+ * repo's `bridge/` and docs/BRIDGE.md) -- kept entirely separate from
+ * `/events/claude` rather than folded into it, because the two carry
+ * genuinely different session identity: `/events/claude` derives sessionRef
+ * from a hash of the pairing token itself (one token, one session, by
+ * construction), which is exactly what the bridge model replaces. A single
+ * bridge speaks for many real Claude sessions under one pairing token, so
+ * its events carry the real `providerSessionId` explicitly instead. Both
+ * endpoints keep working independently -- a machine still using the old
+ * direct per-session hook config is unaffected by any of this.
  */
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -32,6 +43,10 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/events/claude") {
       return handleClaudeEvent(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/events/bridge") {
+      return handleBridgeEvent(request, env);
     }
 
     if (url.pathname === "/ws") {
@@ -88,6 +103,59 @@ async function handleClaudeEvent(request: Request, env: Env): Promise<Response> 
   // session is handled by quietly no-op'ing the presence/confirm side of
   // this request, never by returning something that could be misread as a
   // block decision.
+  return Response.json({});
+}
+
+interface BridgeEventPayload {
+  providerSessionId?: string;
+  provider?: "claude" | "codex" | "gemini" | "other";
+  cwd?: string;
+  state?: "working" | "idle" | "stopped";
+  activity?: string;
+  timestamp?: number;
+}
+
+async function handleBridgeEvent(request: Request, env: Env): Promise<Response> {
+  const auth = request.headers.get("Authorization");
+  const token = auth?.startsWith("Bearer ") ? auth.slice("Bearer ".length) : undefined;
+  if (!token) return unauthorizedHookResponse();
+
+  let claims;
+  try {
+    claims = await verifyPairingToken(env, token);
+  } catch {
+    return unauthorizedHookResponse();
+  }
+
+  let payload: BridgeEventPayload;
+  try {
+    payload = await request.json();
+  } catch {
+    return new Response("Invalid JSON", { status: 400 });
+  }
+  if (!payload.providerSessionId) {
+    return new Response("providerSessionId is required", { status: 400 });
+  }
+
+  // sr_claude_<real Claude session id> -- deliberately NOT derived from the
+  // token (that's the whole point: one bridge, one pairing token, many
+  // sessions). See docs/BRIDGE.md "Session identity fix."
+  const sessionRef = `sr_${payload.provider ?? "claude"}_${payload.providerSessionId}`;
+  const event: NormalizedEvent = {
+    state: payload.state ?? "working",
+    activity: payload.activity,
+    timestamp: payload.timestamp,
+  };
+  const result = await recordPresence(env, claims.workspaceId, sessionRef, event);
+
+  if (result.isNew && !result.revoked) {
+    await confirmBridgeSessionWithForge(env, token, payload.providerSessionId, payload.cwd).catch(() => {
+      // Same tradeoff as confirmWithForge below: presence is still recorded
+      // either way, a failed confirm just delays Worldview's registered
+      // list picking this session up until the next isNew moment.
+    });
+  }
+
   return Response.json({});
 }
 
@@ -156,6 +224,30 @@ async function confirmWithForge(env: Env, pairingToken: string): Promise<void> {
       Authorization: `Bearer ${env.GATEWAY_SHARED_SECRET}`,
     },
     body: JSON.stringify({ pairingToken }),
+  });
+  if (!response.ok) {
+    throw new Error(`Forge callback failed: ${response.status}`);
+  }
+}
+
+/** Same endpoint as confirmWithForge, extended with the real session
+ *  identity a bridge-driven event carries that a lone pairing token never
+ *  could. Forge's route (app/api/gateway/sessions/route.ts) treats these
+ *  extra fields as optional, so this is additive, not a breaking change to
+ *  the old per-session flow. */
+async function confirmBridgeSessionWithForge(
+  env: Env,
+  pairingToken: string,
+  providerSessionId: string,
+  cwd: string | undefined,
+): Promise<void> {
+  const response = await fetch(`${env.FORGE_CALLBACK_URL}/api/gateway/sessions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.GATEWAY_SHARED_SECRET}`,
+    },
+    body: JSON.stringify({ pairingToken, providerSessionId, cwd }),
   });
   if (!response.ok) {
     throw new Error(`Forge callback failed: ${response.status}`);
