@@ -13,7 +13,7 @@ Agents: read [AGENTS.md](AGENTS.md) first, then follow
 ## This repository
 
 - **Role:** service
-- **Surface:** none (Cloudflare Worker, not yet deployed)
+- **Surface:** forge-gateway.harithkavish40.workers.dev (Cloudflare Worker; every route token-gated)
 - **Production branch:** `main`
 - **Development branch:** `development`
 - **Last verified against governance:** 2026-09-11T13:40:00Z

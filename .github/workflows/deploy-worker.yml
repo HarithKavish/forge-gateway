@@ -1,0 +1,31 @@
+name: Deploy Worker
+
+# Deploys the forge-gateway Worker whenever it changes on main.
+# The first deploy was done manually to bring the API up during initial
+# development; this is what keeps every deploy after that declared in the
+# repository rather than run from someone's machine (standards/DEPLOYMENT.md).
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "wrangler.toml", "package.json", "package-lock.json", "tsconfig.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the commit SHA of the cloudflare/wrangler-action v3 tag
+      # (9acf94ace14e7dc412b076f2c5c20b8ce93c79cd), resolved live via
+      # `gh api repos/cloudflare/wrangler-action/git/ref/tags/v3` on
+      # 2026-10-12. NEVER pin a SHA you have not resolved — an earlier
+      # revision of this template carried a garbled SHA (4c732b6f...) that
+      # does not exist (GitHub 422) and the workflow would have failed on
+      # its first run with "unable to resolve action".
+      - uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          command: deploy
