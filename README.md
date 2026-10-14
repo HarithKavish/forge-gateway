@@ -14,8 +14,13 @@ the browser.
 
 ## Where it lives
 
-Deployed on Cloudflare Workers. No live URL yet — first deploy is still
-pending (`wrangler deploy`).
+Deployed on Cloudflare Workers, live at
+https://forge-gateway.harithkavish40.workers.dev — nothing is served without a
+valid token: unauthenticated requests to the event and presence endpoints get
+401, and the WebSocket endpoint requires a viewer token on upgrade. The first
+deploy was done manually; deploys after that are declared in the repository via
+`.github/workflows/deploy-worker.yml` (triggers on push to `main`, requires
+the `CLOUDFLARE_API_TOKEN` Actions secret).
 
 ## How to run it
 
