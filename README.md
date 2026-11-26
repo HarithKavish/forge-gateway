@@ -38,7 +38,8 @@ and authenticates this Worker's callback to Forge. `FORGE_CALLBACK_URL`
 (`wrangler.toml`, a plain var — defaults to `http://localhost:3000`) needs to
 point at wherever Forge actually runs.
 
-Deploy with `npm run deploy`. Typecheck with `npm run typecheck`.
+Merging to main deploys it, through `.github/workflows/deploy-worker.yml`; pull requests get a
+type-check and a dry-run build. Typecheck locally with `npm run typecheck`.
 
 ## Connecting a real Claude Code session
 
